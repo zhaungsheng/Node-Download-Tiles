@@ -24,7 +24,7 @@
     };
 
     const logElement = document.getElementById('tips');
-    // 修改：分批次遍历目录生成文件列表
+    // 分批次遍历目录生成文件列表
     async function traverseDirectoryBatch(dirHandle, batchSize = 1) {
         const fileSet = new Set();
         const queue = [{handle: dirHandle, path: ''}];
@@ -94,7 +94,7 @@
         return lon >= minLng && lon <= maxLng && lat >= minLat && lat <= maxLat;
     }
 
-    // 写入失败日志（浏览器环境）
+    // 写入失败日志
     async function writeFailedTileLog(logHandle, failedTile) {
         const logEntry = `z=${failedTile.z}, x=${failedTile.x}, y=${failedTile.y}, url=${failedTile.url}\n`;
         const writable = await logHandle.createWritable({append: true});
@@ -102,11 +102,11 @@
         await writable.close();
     }
 
-    // 下载单个瓦片，带重试（浏览器环境适配）
+    // 下载单个瓦片，带重试
     async function downloadTile(url, fileHandle, retry = 3) {
         for (let i = 0; i < retry; i++) {
             try {
-                const response = await fetch(url); // 改用浏览器fetch
+                const response = await fetch(url); 
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const blob = await response.blob();
 
@@ -121,7 +121,7 @@
         }
     }
 
-    // 并发控制（简单实现）
+    // 并发控制
     function concurrencyLimit(limit) {
         let active = 0;
         const queue = [];
@@ -139,11 +139,11 @@
         };
     }
 
-    // 主函数（浏览器适配版）
+    // 主函数
     async function startDownload(data) {
         const {minLat, minLng, maxLat, maxLng, minZoom, maxZoom} = data;
 
-        // 用户选择输出目录（需要用户手势触发）
+        // 用户选择输出目录
         const dirHandle = await window.showDirectoryPicker({
             mode: 'readwrite',
             suggestedName: 'tiles'
@@ -157,8 +157,6 @@
 
         // 创建失败日志文件
         const logHandle = await dirHandle.getFileHandle('failed_tiles.log', {create: true});
-
-        // 优化3：创建独立日志元素替代频繁console.log（减少主线程IO）
 
         let successCount = 0, failCount = 0, skippedCount = 0;
         let downloadCounter = 0;
@@ -192,7 +190,7 @@
                         }
 
                         try {
-                            // 优化5：使用文件流管道替代直接写入（减少内存占用）
+                    
                             const fileHandle = await xDir.getFileHandle(`${y}.png`, {create: true});
                             const writable = await fileHandle.createWritable();
                             const response = await fetch(url);
@@ -201,11 +199,11 @@
                             successCount++;
                             downloadCounter++;
 
-                            // 优化6：动态调整暂停间隔（原固定100→根据内存使用自动调整）
+                        
                             if (downloadCounter % 100 === 0) {
                                 logElement.textContent = '检测到内存压力，暂停5秒...';
                                 await new Promise(resolve => setTimeout(resolve, 5000));
-                                // 主动触发垃圾回收（仅Chrome有效）
+                                // 主动触发垃圾回收
                                 if (window.gc) window.gc();
                             }
 
@@ -218,13 +216,12 @@
                     });
                 }
             }
-            // 优化7：层级完成后清理临时变量
+         
             xRange.length = 0;
             yRange.length = 0;
             updateLog();
         }
 
-        // 优化8：最终清理DOM元素
         document.body.removeChild(logElement);
         console.log(`下载完成！成功: ${successCount}，失败: ${failCount}，跳过: ${skippedCount}`);
     }
@@ -270,7 +267,7 @@
         logElement.textContent = `瓦片总数: ${totalTiles}, 已存在: ${existingInRangeCount}, 需要下载: ${needDownloadCount}`;
     }
 
-    // 浏览器入口：需要用户点击触发（因为文件系统API需要用户手势）
+
     document.addEventListener('DOMContentLoaded', () => {
         const startBtn = document.createElement('button');
         startBtn.textContent = '开始下载瓦片';
@@ -291,3 +288,4 @@
 </script>
 </body>
 </html>
+
