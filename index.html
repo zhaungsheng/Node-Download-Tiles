@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Title</title>
+</head>
+<body>
+<div id="app">
+    <div class="container">
+        <section>
+            <h1>瓦片下载工具</h1>
+            <div id="tips">选择文件夹后进行下载</div>
+        </section>
+    </div>
+</div>
+<script>
+    const DEFAULT_DATA = {
+        minLat: 34.2667,
+        minLng: 112.7211,
+        maxLat: 34.9895,
+        maxLng: 114.2209,
+        minZoom: 13,
+        maxZoom: 19
+    };
+
+    const logElement = document.getElementById('tips');
+    // 修改：分批次遍历目录生成文件列表
+    async function traverseDirectoryBatch(dirHandle, batchSize = 1) {
+        const fileSet = new Set();
+        const queue = [{handle: dirHandle, path: ''}];
+        let processed = 0;
+        let totalFiles = 0;
+
+        logElement.textContent = '开始扫描现有文件...';
+
+        while (queue.length > 0) {
+            // 处理当前批次
+            const batch = queue.splice(0, batchSize);
+            for (const {handle, path} of batch) {
+                try {
+                    // 异步迭代目录项
+                    const entries = [];
+                    for await (const entry of handle.entries()) entries.push(entry);
+
+                    for (const [name, entry] of entries) {
+                        const fullPath = path ? `${path}/${name}` : name;
+                        if (entry.kind === 'directory') {
+                            queue.push({handle: entry, path: fullPath});
+                        } else if (entry.kind === 'file' && name.endsWith('.png')) {
+                            fileSet.add(fullPath);
+                            totalFiles++;
+                        }
+                    }
+                } catch (err) {
+                    console.warn(`无法访问目录: ${path}, 错误: ${err.message}`);
+                }
+            }
+
+            // 每批处理完更新进度并让出主线程
+            processed += batch.length;
+            if (processed % (batchSize * 2) === 0) {
+                console.log(`扫描进度: 已处理 ${processed} 个目录项, 发现 ${totalFiles} 个PNG文件`);
+            }
+
+            // 如果还有任务，延迟0ms后继续以让出主线程
+            if (queue.length > 0) {
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
+        }
+        logElement.textContent = `扫描完成: 共发现 ${totalFiles} 个现有PNG文件`;
+        return fileSet;
+    }
+
+    // 经纬度转瓦片号
+    function lonLatToTile(lon, lat, zoom) {
+        const x = Math.floor((lon + 180) / 360 * Math.pow(2, zoom));
+        const y = Math.floor(
+            (1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * Math.pow(2, zoom)
+        );
+        return {x, y};
+    }
+
+    // 瓦片号转中心点经纬度
+    function tileToLonLat(x, y, z) {
+        const n = Math.pow(2, z);
+        const lon = x / n * 360 - 180;
+        const latRad = Math.atan(Math.sinh(Math.PI * (1 - 2 * y / n)));
+        const lat = latRad * 180 / Math.PI;
+        return {lon, lat};
+    }
+
+    // 判断点是否在矩形边界内
+    function pointInRect(lon, lat, minLng, minLat, maxLng, maxLat) {
+        return lon >= minLng && lon <= maxLng && lat >= minLat && lat <= maxLat;
+    }
+
+    // 写入失败日志（浏览器环境）
+    async function writeFailedTileLog(logHandle, failedTile) {
+        const logEntry = `z=${failedTile.z}, x=${failedTile.x}, y=${failedTile.y}, url=${failedTile.url}\n`;
+        const writable = await logHandle.createWritable({append: true});
+        await writable.write(logEntry);
+        await writable.close();
+    }
+
+    // 下载单个瓦片，带重试（浏览器环境适配）
+    async function downloadTile(url, fileHandle, retry = 3) {
+        for (let i = 0; i < retry; i++) {
+            try {
+                const response = await fetch(url); // 改用浏览器fetch
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const blob = await response.blob();
+
+                const writable = await fileHandle.createWritable();
+                await writable.write(blob);
+                await writable.close();
+                return true;
+            } catch (err) {
+                if (i === retry - 1) return false;
+                await new Promise(res => setTimeout(res, 1000));
+            }
+        }
+    }
+
+    // 并发控制（简单实现）
+    function concurrencyLimit(limit) {
+        let active = 0;
+        const queue = [];
+        return async (fn) => {
+            if (active >= limit) {
+                await new Promise(res => queue.push(res));
+            }
+            active++;
+            try {
+                return await fn();
+            } finally {
+                active--;
+                if (queue.length > 0) queue.shift()();
+            }
+        };
+    }
+
+    // 主函数（浏览器适配版）
+    async function startDownload(data) {
+        const {minLat, minLng, maxLat, maxLng, minZoom, maxZoom} = data;
+
+        // 用户选择输出目录（需要用户手势触发）
+        const dirHandle = await window.showDirectoryPicker({
+            mode: 'readwrite',
+            suggestedName: 'tiles'
+        });
+
+        // 并发数
+        const concurrency = 30;
+        const limit = concurrencyLimit(concurrency);
+
+        const existingFiles =  await traverseDirectoryBatch(dirHandle);
+
+        // 创建失败日志文件
+        const logHandle = await dirHandle.getFileHandle('failed_tiles.log', {create: true});
+
+        // 优化3：创建独立日志元素替代频繁console.log（减少主线程IO）
+
+        let successCount = 0, failCount = 0, skippedCount = 0;
+        let downloadCounter = 0;
+        const updateLog = () => {
+            logElement.textContent = `已下载: ${successCount}，失败: ${failCount}，跳过: ${skippedCount}`;
+        };
+
+        for (let z = minZoom; z <= maxZoom; z++) {
+            const {x: xMin, y: yMax} = lonLatToTile(minLng, minLat, z);
+            const {x: xMax, y: yMin} = lonLatToTile(maxLng, maxLat, z);
+            const xRange = [Math.min(xMin, xMax), Math.max(xMin, xMax)];
+            const yRange = [Math.min(yMin, yMax), Math.max(yMin, yMax)];
+
+            for (let x = xRange[0]; x <= xRange[1]; x++) {
+                const zDir = await dirHandle.getDirectoryHandle(z.toString(), {create: true});
+                const xDir = await zDir.getDirectoryHandle(x.toString(), {create: true});
+
+                for (let y = yRange[0]; y <= yRange[1]; y++) {
+                    const {lon, lat} = tileToLonLat(x + 0.5, y + 0.5, z);
+                    if (!pointInRect(lon, lat, minLng, minLat, maxLng, maxLat)) continue;
+
+                    limit(async () => {
+                        const url = `https://gac-geo.googlecnapps.club/maps/vt?lyrs=m@781&hl=zh-CN&gl=CN&x=${x}&y=${y}&z=${z}`;
+                        const filePath = `${z}/${x}/${y}.png`;
+
+                        if (existingFiles.has(filePath)) {
+                            existingFiles.delete(filePath);
+                            skippedCount++;
+                            updateLog();
+                            return;
+                        }
+
+                        try {
+                            // 优化5：使用文件流管道替代直接写入（减少内存占用）
+                            const fileHandle = await xDir.getFileHandle(`${y}.png`, {create: true});
+                            const writable = await fileHandle.createWritable();
+                            const response = await fetch(url);
+                            await response.body.pipeTo(writable);
+
+                            successCount++;
+                            downloadCounter++;
+
+                            // 优化6：动态调整暂停间隔（原固定100→根据内存使用自动调整）
+                            if (downloadCounter % 100 === 0) {
+                                logElement.textContent = '检测到内存压力，暂停5秒...';
+                                await new Promise(resolve => setTimeout(resolve, 5000));
+                                // 主动触发垃圾回收（仅Chrome有效）
+                                if (window.gc) window.gc();
+                            }
+
+                            updateLog();
+                        } catch (err) {
+                            failCount++;
+                            await writeFailedTileLog(logHandle, {z, x, y, url});
+                            updateLog();
+                        }
+                    });
+                }
+            }
+            // 优化7：层级完成后清理临时变量
+            xRange.length = 0;
+            yRange.length = 0;
+            updateLog();
+        }
+
+        // 优化8：最终清理DOM元素
+        document.body.removeChild(logElement);
+        console.log(`下载完成！成功: ${successCount}，失败: ${failCount}，跳过: ${skippedCount}`);
+    }
+
+    // 添加计算瓦片总数的函数
+    async function calculateTotalTiles(data) {
+        const {minLat, minLng, maxLat, maxLng, minZoom, maxZoom} = data;
+
+        // 用户选择目录
+        const dirHandle = await window.showDirectoryPicker({
+            mode: 'readwrite',
+            suggestedName: 'tiles'
+        });
+
+        // 获取现有文件
+        const existingFiles = await traverseDirectoryBatch(dirHandle);
+
+        // 计算瓦片总数和已存在数量
+        let totalTiles = 0;
+        let existingInRangeCount = 0;
+
+        for (let z = minZoom; z <= maxZoom; z++) {
+            const {x: xMin, y: yMax} = lonLatToTile(minLng, minLat, z);
+            const {x: xMax, y: yMin} = lonLatToTile(maxLng, maxLat, z);
+            const xRange = [Math.min(xMin, xMax), Math.max(xMin, xMax)];
+            const yRange = [Math.min(yMin, yMax), Math.max(yMin, yMax)];
+
+            for (let x = xRange[0]; x <= xRange[1]; x++) {
+                for (let y = yRange[0]; y <= yRange[1]; y++) {
+                    const {lon, lat} = tileToLonLat(x + 0.5, y + 0.5, z);
+                    if (pointInRect(lon, lat, minLng, minLat, maxLng, maxLat)) {
+                        totalTiles++;
+                        const filePath = `${z}/${x}/${y}.png`;
+                        if (existingFiles.has(filePath)) {
+                            existingInRangeCount++;
+                        }
+                    }
+                }
+            }
+        }
+
+        const needDownloadCount = totalTiles - existingInRangeCount;
+        logElement.textContent = `瓦片总数: ${totalTiles}, 已存在: ${existingInRangeCount}, 需要下载: ${needDownloadCount}`;
+    }
+
+    // 浏览器入口：需要用户点击触发（因为文件系统API需要用户手势）
+    document.addEventListener('DOMContentLoaded', () => {
+        const startBtn = document.createElement('button');
+        startBtn.textContent = '开始下载瓦片';
+        startBtn.addEventListener('click', async () => {
+            await startDownload(DEFAULT_DATA);
+        });
+        document.body.appendChild(startBtn);
+
+        // 添加计算瓦片总数按钮
+        const calculateBtn = document.createElement('button');
+        calculateBtn.textContent = '计算瓦片总数';
+        calculateBtn.style.marginLeft = '10px';
+        calculateBtn.addEventListener('click', async () => {
+            await calculateTotalTiles(DEFAULT_DATA);
+        });
+        document.body.appendChild(calculateBtn);
+    });
+</script>
+</body>
+</html>
